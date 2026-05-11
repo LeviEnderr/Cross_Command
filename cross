@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""cross — universal downloader | made by levi"""
+
+import os, sys, re, time, glob, json, urllib.request, subprocess, random, shutil
+from html import unescape
+
+IS_WIN = sys.platform == 'win32'
+G,R,Y,CY,B,D,W,RS = '\033[92m','\033[91m','\033[93m','\033[96m','\033[1m','\033[2m','\033[97m','\033[0m'
+
+if IS_WIN:
+    import ctypes; ctypes.windll.kernel32.SetConsoleMode(ctypes.windll.kernel32.GetStdHandle(-11), 7)
+
+_ANSI = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+vlen  = lambda s: len(_ANSI.sub('', s))
+clr   = lambda: os.system('cls' if IS_WIN else 'clear')
+
+class _Log:
+    def debug(self,m): pass
+    def info(self,m):  pass
+    def warning(self,m): pass
+    def error(self,m): pass
+
+def box(lines, c=G):
+    w = max(vlen(l) for l in lines) + 2
+    print(f"  {c}╔{'═'*(w+2)}╗{RS}")
+    for l in lines: print(f"  {c}║{RS} {l}{' '*(w-vlen(l))} {c}║{RS}")
+    print(f"  {c}╚{'═'*(w+2)}╝{RS}")
+
+def err(msg):
+    msg = msg[:120]+'…' if len(msg)>120 else msg
+    print(f"\n  {R}✗  {msg}{RS}\n  {D}cross <url> -mp3|-mp4 [dest] [-p]{RS}\n"); sys.exit(1)
+
+# ─── ASCII ────────────────────────────────────────────────────────────────────
+SMALL = [" __     ","/_/\\/\\ ","\\_\\  / ","/_/  \\ ","\\_\\/\\ \\","   \\_\\/ "]
+
+HELP_ASCII = [
+    "                .---.              ",
+    "                |   |             ",
+    "             ___|   |___          ",
+    "            [           ]         ",
+    "            '---.   .---'         ",
+    "         __||__ |   | __||__      ",
+    "         '-..-' |   | '-..-'      ",
+    "           ||   |   |   ||        ",
+    "           ||_.-|   |-,_||        ",
+    '         .-"`   `"`'+"'"+'`   `"-.  ',
+    "       .'                   '.    ",
+]
+
+# ─── Allowed sites ────────────────────────────────────────────────────────────
+ALLOWED = ['youtube.com','youtu.be','open.spotify.com','raiplay.it']
+BLOCKED = ['pornhub.com','xvideos.com','xnxx.com','xhamster.com','redtube.com']
+BIBLE   = [
+    '"Flee from sexual immorality." — 1 Corinthians 6:18',
+    '"I made a covenant with my eyes not to look lustfully." — Job 31:1',
+    '"Do not be deceived: God cannot be mocked." — Galatians 6:7',
+    '"Whatever is noble, whatever is right... think about such things." — Philippians 4:8',
+    '"The eye is the lamp of the body." — Matthew 6:22',
+]
+
+def check_url(url):
+    if any(b in url for b in BLOCKED):
+        print(f"\n  {R}✗  Not on my watch.{RS}\n\n  {Y}\"{random.choice(BIBLE)}\"{RS}\n"); sys.exit(1)
+    if not any(a in url for a in ALLOWED):
+        print(f"\n  {R}✗  Site not supported.{RS}\n  {D}supported: YouTube, Spotify, RaiPlay{RS}\n"); sys.exit(1)
+
+# ─── URL detection ────────────────────────────────────────────────────────────
+is_sp_track    = lambda u: 'open.spotify.com/' in u and '/track/'    in u
+is_sp_playlist = lambda u: 'open.spotify.com/' in u and ('/playlist/' in u or '/album/' in u)
+
+def is_yt_playlist(url):
+    if not any(x in url for x in ('youtube.com','youtu.be')): return False
+    m = re.search(r'[?&]list=([^&]+)', url)
+    return bool(m) and not m.group(1).startswith(('RD','LL','WL','FL'))
+
+# ─── File naming ──────────────────────────────────────────────────────────────
+def camel(s):
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]','',s)
+    return ''.join(w.capitalize() for w in re.split(r'[\s\-_–—]+',s.strip()) if w)
+
+def build_name(title, artist, mode):
+    if mode == 'mp3':
+        if not artist:
+            m = re.match(r'^(.+?)\s*[-–—]\s*(.+)$', title)
+            if m: artist, title = m.group(1).strip(), m.group(2).strip()
+        t,a = camel(title), camel(artist) if artist else ''
+        return f"{t}-{a}" if a else t
+    return camel(title)
+
+def pl_folder(name):
+    return re.sub(r'[\s\-–—]+','_', re.sub(r'[<>:"/\\|?*\x00-\x1f]','',name).strip()).lower().strip('_')
+
+def unique(path):
+    if not os.path.exists(path): return path
+    base, ext = os.path.splitext(path)
+    sep = '_' if not ext else ''
+    i = 1
+    while os.path.exists(f"{base}{sep}({i:02d}){ext}"): i += 1
+    return f"{base}{sep}({i:02d}){ext}"
+
+# ─── Browser cookies ──────────────────────────────────────────────────────────
+def _cookies():
+    for b in ('firefox','chrome','google-chrome','chromium'):
+        if shutil.which(b) or shutil.which(f"{b}.exe"): return (b.replace('google-',''),)
+    return None
+
+_CK = _cookies()
+if not _CK: print(f"  {D}⚠  No browser found — YouTube may block requests.{RS}")
+
+# ─── yt-dlp opts ──────────────────────────────────────────────────────────────
+def base_opts(extra=None):
+    o = dict(quiet=True, no_warnings=True, logger=_Log(),
+             retries=10, fragment_retries=10, socket_timeout=30,
+             hls_prefer_ffmpeg=True,
+             js_runtimes={'node':{}}, remote_components={'ejs:github'})
+    if _CK: o['cookiesfrombrowser'] = _CK
+    if extra: o.update(extra)
+    return o
+
+def dl_opts(dest, tmp, mode, hook):
+    o = base_opts({'progress_hooks':[hook],
+                   'outtmpl': os.path.join(dest, f'{tmp}.%(ext)s')})
+    if mode == 'mp3':
+        o['format'] = '140/251/139/249/18/bestaudio'
+        o['postprocessors'] = [{'key':'FFmpegExtractAudio','preferredcodec':'mp3','preferredquality':'320'}]
+    else:
+        o['format'] = '137+140/136+140/135+140/248+251/bestvideo+bestaudio/best'
+        o['merge_output_format'] = 'mp4'
+    return o
+
+def get_info(url):
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL(base_opts({'skip_download':True})) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e: err(f"Could not read URL: {e}")
+
+# ─── Progress ─────────────────────────────────────────────────────────────────
+class Progress:
+    def __init__(self): self.reset()
+
+    def reset(self):
+        self.pct=0.0; self.spd=''; self.eta=''; self.done=False
+        self.files=set(); self.last=-1.0; self.pl_cur=0; self.pl_tot=0; self.pl_title=''
+
+    def set_pl(self, cur, tot, title=''):
+        self.pl_cur=cur; self.pl_tot=tot; self.pl_title=title
+
+    def hook(self, d):
+        key = d.get('filename', id(d))
+        if d['status'] == 'downloading' and key not in self.files:
+            try: pct = float(_ANSI.sub('',d.get('_percent_str','0%')).strip().replace('%',''))
+            except: return
+            if pct - self.last < 0.5: return
+            self.pct=pct; self.last=pct
+            self.spd=d.get('_speed_str','').strip(); self.eta=d.get('_eta_str','').strip()
+            self.done=False; self.render()
+        elif d['status'] == 'finished' and key not in self.files:
+            self.pct=100.0; self.last=100.0; self.done=True
+            self.files.add(key); self.render()
+
+    def render(self):
+        p = self.pct; done = self.done
+        bar = f"{G}{'█'*25}{RS} {G}✓{RS}" if done else \
+              f"{G}{'█'*int(p/4)}{D}{'░'*(25-int(p/4))}{RS}"
+        pct_s = "100%" if done else f"{p:5.1f}%"
+        spd_s = '' if done else (f"  {D}{self.spd}{RS}" if self.spd else '')
+        eta_s = '' if done else (f"  {D}ETA {self.eta}{RS}" if self.eta else '')
+
+        src  = self._ctx.get('source','')
+        icon = ('♫' if src=='spotify' else '▶') if not IS_WIN else ('?' if src=='spotify' else '>')
+        mode = self._ctx.get('mode','mp3')
+        RW   = 46
+        rp   = lambda s: s+' '*max(0,RW-vlen(s))
+
+        menu = [rp(f"{icon} {CY}{'Spotify' if src=='spotify' else 'YouTube'}{RS}  {D}|{RS}  {W}{B}{'MP3 · 320kbps' if mode=='mp3' else 'MP4 · best'}{RS}"),
+                rp(f"{D}{'─'*RW}{RS}")]
+        if self._ctx.get('artist'): menu.append(rp(f"{D}artist {RS}{W}{self._ctx['artist'][:36]}{RS}"))
+        menu += [rp(f"{D}title  {RS}{W}{B}{self._ctx.get('title','')[:36]}{RS}"),
+                 rp(f"{D}dest   {RS}{D}{self._ctx.get('dest','')[:36]}{RS}"),
+                 rp(f"{D}{'─'*RW}{RS}"),
+                 rp(f"{bar} {pct_s}{spd_s}{eta_s}")]
+        if self.pl_cur and self.pl_tot:
+            menu.append(rp(f"{D}track  {RS}{W}{self.pl_cur}/{self.pl_tot}{RS}  {D}{self.pl_title[:24]}{RS}"))
+
+        asc = ['']*max(0,(len(menu)-len(SMALL))//2) + [f"{G}{l}{RS}" for l in SMALL]
+        asc += [''] * max(0, len(menu)-len(asc))
+        clr(); print()
+        for i,ml in enumerate(menu):
+            a = asc[i] if i<len(asc) else ''
+            print(f"  {a}{' '*max(0,10-vlen(a))}  {ml}")
+        print()
+
+    def set_ctx(self, **kw): self._ctx = kw
+    _ctx = {}
+
+P = Progress()
+
+# ─── Finalize ─────────────────────────────────────────────────────────────────
+def finalize(dest, tmp, mode, name):
+    ext   = 'mp3' if mode=='mp3' else 'mp4'
+    found = glob.glob(os.path.join(dest, f'{tmp}*'))
+    path  = unique(os.path.join(dest, f'{name}.{ext}'))
+    if not found: return path
+    src = found[0]
+    if mode == 'mp4':
+        r = subprocess.run(['ffmpeg','-y','-fflags','+genpts','-i',src,
+                            '-c','copy','-avoid_negative_ts','make_zero',
+                            '-movflags','+faststart',path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode == 0:
+            try: os.remove(src)
+            except: pass
+        else:
+            try: os.rename(src, path)
+            except: pass
+    else:
+        os.rename(src, path)
+    return path
+
+# ─── Download ─────────────────────────────────────────────────────────────────
+def dl_single(url, mode, dest):
+    try: import yt_dlp
+    except: err("yt-dlp not found.")
+    os.makedirs(dest, exist_ok=True)
+    info   = get_info(url)
+    title  = info.get('title','Unknown'); artist = info.get('artist') or ''
+    P.reset(); P.set_ctx(title=title, artist=artist, source='youtube', mode=mode,
+                         dest=os.path.abspath(dest))
+    P.render()
+    tmp = f"__cross_{int(time.time())}"
+    try:
+        with yt_dlp.YoutubeDL(dl_opts(dest, tmp, mode, P.hook)) as ydl: ydl.download([url])
+    except yt_dlp.utils.DownloadError as e: err(str(e))
+    except KeyboardInterrupt: print(f"\n  {Y}⚠  Cancelled.{RS}"); sys.exit(0)
+    return finalize(dest, tmp, mode, build_name(title, artist, mode))
+
+def dl_spotify(url, dest):
+    try: import yt_dlp
+    except: err("yt-dlp not found.")
+    os.makedirs(dest, exist_ok=True)
+    title, artist = sp_track_info(url)
+    if not title: err("Could not read info from Spotify.")
+    name  = build_name(title, artist or '', 'mp3')
+    query = f"{title} {artist}".strip() if artist else title
+    P.reset(); P.set_ctx(title=title, artist=artist or '', source='spotify', mode='mp3',
+                         dest=os.path.abspath(dest))
+    P.render()
+    tmp = f"__cross_{int(time.time())}"
+    try:
+        with yt_dlp.YoutubeDL(dl_opts(dest, tmp, 'mp3', P.hook)) as ydl:
+            ydl.download([f"ytsearch1:{query}"])
+    except yt_dlp.utils.DownloadError as e: err(str(e))
+    except KeyboardInterrupt: print(f"\n  {Y}⚠  Cancelled.{RS}"); sys.exit(0)
+    return finalize(dest, tmp, 'mp3', name)
+
+# ─── Spotify scraping ─────────────────────────────────────────────────────────
+_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+def sp_fetch(url):
+    req = urllib.request.Request(url, headers={'User-Agent':_UA,'Accept-Language':'en-US,en;q=0.9'})
+    with urllib.request.urlopen(req, timeout=12) as r: return r.read().decode('utf-8','ignore')
+
+def sp_track_info(url):
+    try:
+        tid = url.split('/track/')[1].split('?')[0]
+        # Titolo via oEmbed
+        with urllib.request.urlopen(
+            f'https://open.spotify.com/oembed?url=https://open.spotify.com/track/{tid}',
+            timeout=10) as r:
+            title = json.loads(r.read()).get('title','')
+        # Artista via embed
+        req = urllib.request.Request(
+            f'https://open.spotify.com/embed/track/{tid}',
+            headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            html = r.read().decode('utf-8','ignore')
+        a = re.search(r'"artists".*?"name":"([^"]+)"', html)
+        return title or None, (a.group(1) if a else None)
+    except: return None, None
+
+def _sp_parse(data):
+    tracks = []
+    try:
+        entity = data['props']['pageProps']['state']['data']['entity']
+        for item in (entity.get('trackList') or []):
+            t,a = item.get('title',''), item.get('subtitle','')
+            if t: tracks.append((unescape(t), unescape(a)))
+        if not tracks:
+            for item in entity.get('tracks',{}).get('items',[]):
+                trk = item.get('track') or item
+                t   = trk.get('name','')
+                a   = ', '.join(x['name'] for x in trk.get('artists',[]) if x.get('name'))
+                if t: tracks.append((t, a))
+    except: pass
+    return tracks
+
+def sp_playlist_tracks(url):
+    kind = 'playlist' if '/playlist/' in url else 'album'
+    pid  = url.split(f'/{kind}/')[1].split('?')[0]
+    tracks = []; html = ''
+    for endpoint in [f'https://open.spotify.com/embed/{kind}/{pid}',
+                     f'https://open.spotify.com/{kind}/{pid}']:
+        try:
+            html = sp_fetch(endpoint)
+            m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.DOTALL)
+            if m:
+                tracks = _sp_parse(json.loads(m.group(1)))
+                if tracks: break
+        except: continue
+    if not tracks and html:
+        tracks = [(unescape(m.group(1)),'') for m in
+                  re.finditer(r'"name"\s*:\s*"([^"]+)"[^}]*"@type"\s*:\s*"MusicRecording"', html, re.DOTALL)]
+    return tracks
+
+def sp_playlist_name(url):
+    try:
+        kind = 'playlist' if '/playlist/' in url else 'album'
+        pid  = url.split(f'/{kind}/')[1].split('?')[0]
+        html = sp_fetch(f'https://open.spotify.com/{kind}/{pid}')
+        m    = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+        return unescape(m.group(1)) if m else 'playlist'
+    except: return 'playlist'
+
+# ─── Playlist UI ──────────────────────────────────────────────────────────────
+def pl_select_ui(entries, name, folder):
+    TW = 54
+    brow = lambda s: f"  {G}║{RS} {s}{' '*max(0,TW-vlen(s))} {G}║{RS}"
+    print(f"\n  {G}╔{'═'*(TW+2)}╗{RS}")
+    print(brow(f"{W}{B}{name[:TW]}{RS}"))
+    print(brow(f"{D}{len(entries)} tracks  →  {folder}/{RS}"))
+    print(f"  {G}╠{'═'*(TW+2)}╣{RS}")
+    for i,e in enumerate(entries[:8],1): print(brow(f"{D}{i:2}.{RS}  {(e.get('title') or '?')[:48]}"))
+    if len(entries)>8: print(brow(f"{D}     ... and {len(entries)-8} more{RS}"))
+    print(f"  {G}╠{'═'*(TW+2)}╣{RS}")
+    print(brow(f"{D}Download: number / all / 1-5 (range){RS}"))
+    print(f"  {G}╚{'═'*(TW+2)}╝{RS}")
+    while True:
+        try: s = input(f"\n  {CY}>{RS} ").strip().lower()
+        except KeyboardInterrupt: print(); sys.exit(0)
+        if s in ('all','a'): return entries
+        if s.isdigit() and 1<=int(s)<=len(entries): return entries[:int(s)]
+        m = re.match(r'^(\d+)-(\d+)$',s)
+        if m:
+            lo,hi = int(m.group(1))-1,int(m.group(2))
+            if 0<=lo<hi<=len(entries): return entries[lo:hi]
+        print(f"  {Y}invalid — try: all, 5, 2-8{RS}")
+
+def pl_final(downloaded, failed, dest):
+    TW = 54
+    brow = lambda s: f"  {G}║{RS} {s}{' '*max(0,TW-vlen(s))} {G}║{RS}"
+    clr(); print()
+    print(f"  {G}╔{'═'*(TW+2)}╗{RS}")
+    print(brow(f"{G}✓  {len(downloaded)}/{len(downloaded)+len(failed)} tracks downloaded{RS}"))
+    print(brow(f"{D}{os.path.abspath(dest)[:TW]}{RS}"))
+    if failed:
+        print(f"  {G}╠{'═'*(TW+2)}╣{RS}")
+        print(brow(f"{R}not found ({len(failed)}):{RS}"))
+        for item in failed: print(brow(f"  {R}✗  {item[:TW-4]}{RS}"))
+    print(f"  {G}╚{'═'*(TW+2)}╝{RS}\n")
+
+# ─── Playlist download ────────────────────────────────────────────────────────
+def dl_sp_playlist(url, dest):
+    os.makedirs(dest, exist_ok=True)
+    print(f"\n  {D}fetching Spotify playlist...{RS}")
+    tracks = sp_playlist_tracks(url)
+    if not tracks: err("Could not read playlist tracks. Try opening it in a browser first.")
+    name   = sp_playlist_name(url)
+    folder = pl_folder(name)
+    dest   = unique(os.path.join(dest, folder))
+    os.makedirs(dest, exist_ok=True)
+    selected = pl_select_ui([{'title':t,'artist':a} for t,a in tracks], name, folder)
+    downloaded, failed = [], []
+    for i,entry in enumerate(selected,1):
+        title, artist = entry['title'], entry.get('artist','')
+        try:
+            import yt_dlp
+            query = f"{title} {artist} official audio".strip() if artist else f"{title} official audio"
+            tmp   = f"__cross_{int(time.time())}_{i}"
+            P.reset(); P.set_pl(i, len(selected), title)
+            P.set_ctx(title=title, artist=artist, source='spotify', mode='mp3', dest=os.path.abspath(dest))
+            P.render()
+            with yt_dlp.YoutubeDL(dl_opts(dest, tmp, 'mp3', P.hook)) as ydl:
+                ydl.download([f"ytsearch1:{query}"])
+            downloaded.append(finalize(dest, tmp, 'mp3', build_name(title, artist, 'mp3')))
+        except KeyboardInterrupt: print(f"\n  {Y}⚠  Cancelled.{RS}"); sys.exit(0)
+        except: failed.append(f"{title} — {artist}" if artist else title)
+    pl_final(downloaded, failed, dest)
+    return downloaded
+
+def dl_yt_playlist(url, mode, dest):
+    try: import yt_dlp
+    except: err("yt-dlp not found.")
+    print(f"\n  {D}fetching playlist...{RS}")
+    with yt_dlp.YoutubeDL(base_opts({'extract_flat':True})) as ydl:
+        pl = ydl.extract_info(url, download=False)
+    entries = pl.get('entries',[])
+    name    = pl.get('title','Playlist')
+    folder  = pl_folder(name)
+    dest    = unique(os.path.join(dest, folder))
+    os.makedirs(dest, exist_ok=True)
+    selected = pl_select_ui(entries, name, folder)
+    downloaded, failed = [], []
+    for i,vid in enumerate(selected,1):
+        vid_id  = vid.get('id','').strip()
+        vid_url = vid.get('url','').strip()
+        if vid_id and not vid_url.startswith('http'):
+            vid_url = f"https://www.youtube.com/watch?v={vid_id}"
+        title_v = vid.get('title') or '?'
+        if not vid_url or vid_url.endswith('v='):
+            failed.append(f"{title_v} — no URL"); continue
+        P.set_pl(i, len(selected), title_v); P._ctx = {}
+        try:
+            try: downloaded.append(dl_single(vid_url, mode, dest))
+            except SystemExit: failed.append(f"{title_v} — private or unavailable")
+        except KeyboardInterrupt: raise
+        except Exception as e: failed.append(f"{title_v} — {str(e)[:50]}")
+    pl_final(downloaded, failed, dest)
+    return downloaded
+
+# ─── Help ─────────────────────────────────────────────────────────────────────
+def print_help():
+    rows = [
+        f"{G}cross{RS} — universal downloader  {D}made by levi{RS}", "",
+        f"{G}  cross <url> -mp3|-mp4 [dest] [-p]{RS}", "",
+        f"  {D}-mp3    audio MP3 320kbps{RS}",
+        f"  {D}-mp4    video MP4 best quality{RS}",
+        f"  {D}dest    output folder (default: current){RS}",
+        f"  {D}-p      playlist mode (YouTube or Spotify){RS}", "",
+        f"  {D}examples:{RS}",
+        f"  {D}cross https://youtu.be/xyz -mp3{RS}",
+        f"  {D}cross https://open.spotify.com/track/xyz -mp3{RS}",
+        f"  {D}cross https://open.spotify.com/playlist/xyz -mp3 ~/Music -p{RS}",
+        f"  {D}cross 'https://youtube.com/watch?v=xyz&list=PLxxx' -mp3 -p{RS}",
+    ]
+    MW = max(vlen(r) for r in rows)+4; BW = MW+4
+    print()
+    for l in HELP_ASCII: print(f"  {' '*max(0,(BW-len(l))//2)}{G}{l}{RS}")
+    print(f"  {G}╔{'═'*(MW+2)}╗{RS}")
+    for r in rows: print(f"  {G}║{RS} {r}{' '*(MW-vlen(r))} {G}║{RS}")
+    print(f"  {G}╚{'═'*(MW+2)}╝{RS}\n")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h','--help'): print_help(); sys.exit(0)
+
+    playlist = '-p' in args; args = [a for a in args if a != '-p']
+    url=None; mode=None; dest='.'
+    for a in args:
+        if   a=='-mp3': mode='mp3'
+        elif a=='-mp4': mode='mp4'
+        elif not a.startswith('-'): url,dest = (a,dest) if url is None else (url,os.path.expanduser(a))
+
+    if not url:  err("No URL specified.")
+    check_url(url)
+    if not mode: err("Specify -mp3 or -mp4.")
+    if 'spotify.com' in url and mode=='mp4':      err("Spotify only supports -mp3.")
+    if is_sp_playlist(url) and not playlist:      err("Spotify playlist — add -p flag.")
+    if is_yt_playlist(url) and not playlist:      err("YouTube playlist — add -p flag.")
+
+    os.makedirs(dest, exist_ok=True)
+
+    if   is_sp_track(url):               r = dl_spotify(url, dest);         box([f"{G}✓  {os.path.basename(r)[:48]}{RS}", f"{D}{os.path.abspath(dest)}{RS}"]); print()
+    elif is_sp_playlist(url) and playlist: dl_sp_playlist(url, dest)
+    elif playlist:                         dl_yt_playlist(url, mode, dest)
+    else:                                  r = dl_single(url, mode, dest);   box([f"{G}✓  {os.path.basename(r)[:48]}{RS}", f"{D}{os.path.abspath(dest)}{RS}"]); print()
+
+if __name__ == '__main__':
+    try: main()
+    except KeyboardInterrupt: print(f"\n  {Y}⚠  Cancelled.{RS}"); sys.exit(0)
